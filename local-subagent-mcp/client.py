@@ -163,6 +163,7 @@ def build_system_prompt(mode: str, repo: str | None, job: str | None) -> str:
             "You are a read-only local subagent. Investigate the task using LocalDev MCP tools. "
             "Do not modify files, create jobs, commit, or attempt shell execution."
         )
+        tool_budget = 12
     else:
         behavior = (
             "You are a bounded local coding subagent. Use LocalDev MCP for repository work. "
@@ -171,6 +172,7 @@ def build_system_prompt(mode: str, repo: str | None, job: str | None) -> str:
             "After editing, run configured tests and benchmark when relevant, inspect the diff, "
             "and commit only when the task is complete and checks are acceptable."
         )
+        tool_budget = 20
 
     return f"""{behavior}
 
@@ -179,13 +181,18 @@ def build_system_prompt(mode: str, repo: str | None, job: str | None) -> str:
 Rules:
 - Never invent tool results.
 - Before guessing a file or path, inspect it with list_files or find_files.
+- list_files/find_files prove path existence only; they do not prove file contents.
+- Attribute a content claim only to a file supported by a successful read_file or a matching search_text result. If the claim goes beyond the matched line, read the file before attributing it.
 - Treat a tool result with ok=false as a real failure. Report its returned error_type/error; never invent an exception class.
+- If read_file returns truncated=true, follow next_start_char first; when it is null, continue from next_start_line. Never repeat an identical successful read_file call.
+- Do not repeat any identical successful tool call without a concrete reason. A repeated_call error means stop that loop and change approach.
 - Do not ask for an arbitrary shell tool; it is intentionally unavailable.
 - If a tool or configured command is unavailable, report that as a blocker instead of pretending it ran.
 - For a simple new text file prefer write_text_file. For one exact replacement in an existing text file prefer replace_text. Reserve apply_patch for edits that actually need a unified diff.
 - Prefer revert_to_latest_checkpoint unless an exact older checkpoint is explicitly required.
 - After any write/edit tool error, inspect git_status and git_diff before retrying the same write.
 - If the same approach fails twice, stop repeating it and reconsider assumptions or choose a different approach.
+- Keep tool use bounded: aim for at most {tool_budget} tool calls. If the task cannot be completed within that budget, stop and report the remaining blocker instead of looping.
 - Keep the final answer compact. Report: status, what you found/changed, tests, benchmark (if any), and remaining risks/blockers.
 - The parent Codex agent receives your final answer and a compact tool trace; internal reasoning is intentionally not forwarded.
 """
@@ -268,6 +275,7 @@ def _compact_tool_arguments(arguments: Any) -> dict[str, Any]:
         "checkpoint",
         "start_line",
         "end_line",
+        "start_char",
         "recursive",
         "case_sensitive",
         "staged",
@@ -361,7 +369,19 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             summary["error_type"] = _short_string(decoded.get("error_type"), 120)
         if decoded.get("error") is not None:
             summary["error"] = _preview(decoded.get("error"), 400)
-        for key in ("repo", "job", "path", "checkpoint", "matches"):
+        for key in (
+            "repo",
+            "job",
+            "path",
+            "checkpoint",
+            "matches",
+            "repeats",
+            "retry_after_seconds",
+            "start_line",
+            "end_line",
+            "start_char",
+            "window_chars",
+        ):
             if key in decoded:
                 value = decoded.get(key)
                 summary[key] = _short_string(value, 240) if isinstance(value, str) else value
@@ -437,10 +457,16 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             summary["jobs"] = [
                 item.get("name") for item in jobs[:12] if isinstance(item, dict) and item.get("name")
             ]
+        for key in ("returned", "result_chars"):
+            if key in decoded:
+                summary[key] = decoded.get(key)
     elif tool == "list_files":
         entries = decoded.get("entries")
         summary["target"] = decoded.get("target")
         summary["base"] = decoded.get("base")
+        for key in ("returned", "result_chars"):
+            if key in decoded:
+                summary[key] = decoded.get(key)
         if isinstance(entries, list):
             summary["entry_count"] = len(entries)
             summary["entries"] = [
@@ -451,6 +477,9 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
     elif tool == "find_files":
         summary["target"] = decoded.get("target")
         summary["pattern"] = _short_string(decoded.get("pattern"), 180)
+        for key in ("returned", "result_chars"):
+            if key in decoded:
+                summary[key] = decoded.get(key)
         results = decoded.get("results")
         if isinstance(results, list):
             summary["result_count"] = len(results)
@@ -466,8 +495,17 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             "start_line",
             "end_line",
             "total_lines",
+            "start_char",
+            "end_char",
+            "window_chars",
+            "content_chars",
             "ends_with_newline",
             "source_ends_with_newline",
+            "truncated_by_chars",
+            "truncated_by_lines",
+            "next_start_char",
+            "next_start_line",
+            "next_hint",
         ):
             if key in decoded:
                 summary[key] = decoded.get(key)
@@ -477,9 +515,9 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             summary["content_sha256"] = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
             summary["content_preview"] = _preview(content, 360)
     elif tool == "search_text":
-        for key in ("target", "query"):
+        for key in ("target", "query", "returned", "result_chars"):
             if key in decoded:
-                summary[key] = _short_string(decoded.get(key), 180)
+                summary[key] = _short_string(decoded.get(key), 180) if isinstance(decoded.get(key), str) else decoded.get(key)
         results = decoded.get("results")
         if isinstance(results, list):
             summary["result_count"] = len(results)
@@ -491,6 +529,9 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
     elif tool in {"git_status", "git_diff", "run_tests", "run_benchmark"}:
         stdout = decoded.get("stdout")
         stderr = decoded.get("stderr")
+        for key in ("output_chars", "output_truncated_by_mcp"):
+            if key in decoded:
+                summary[key] = decoded.get(key)
         if isinstance(stdout, str):
             summary["stdout_chars"] = len(stdout)
             summary["stdout_sha256"] = hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -524,6 +565,7 @@ def compact_response(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
             if len(tool_trace) < _TRACE_MAX_ITEMS:
                 tool_trace.append(
                     {
+                        "index": len(tool_trace) + 1,
                         "tool": name,
                         "arguments": _compact_tool_arguments(item.get("arguments")),
                         **_compact_tool_output(name, item.get("output")),
