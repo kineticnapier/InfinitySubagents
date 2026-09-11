@@ -6,6 +6,7 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 
 from client import LocalAgentClient
+from model_config import list_models, set_model
 
 
 mcp = MCPServer("Local Subagent MCP")
@@ -18,6 +19,12 @@ LOCAL_AGENT = ToolAnnotations(
     idempotent_hint=False,
     open_world_hint=False,
 )
+CONFIG_WRITE = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -27,6 +34,31 @@ def local_agent_health() -> dict[str, Any]:
         return client.health()
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool(annotations=READ_ONLY)
+def local_agent_models() -> dict[str, Any]:
+    """List LM Studio models and show which one Local Subagent MCP currently uses."""
+    try:
+        return {"ok": True, **list_models(client.config_path)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool(annotations=CONFIG_WRITE)
+def local_agent_set_model(model: str) -> dict[str, Any]:
+    """Switch the local worker model to an exact id returned by local_agent_models.
+
+    The model id is verified against LM Studio before config.toml is changed.
+    LocalAgentClient reloads config.toml automatically, so the next worker call uses
+    the new model without restarting Codex or this MCP server.
+    """
+    try:
+        result = set_model(model, client.config_path, verify=True)
+        result["configured_model"] = client.config.model
+        return result
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "model": model}
 
 
 @mcp.tool(annotations=LOCAL_AGENT)
