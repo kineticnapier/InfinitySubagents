@@ -1,116 +1,156 @@
-# LocalDev MCP v0.1
+# LocalDev MCP v0.2
 
-Multi-repository local MCP server for coding agents.
+LocalDev MCP exposes a deliberately constrained local development surface to MCP-capable agents.
 
-## Main design
+The v0.2 goal is **safe isolated coding jobs**:
 
-- One MCP server exposes multiple repos/worktrees.
-- Every MCP call explicitly names `repo`; there is no global `active_repo`.
-- Human-side `manage.py` controls which paths are registered.
-- Windows paths such as `F:\dev\MinoFlux` are converted to `/mnt/f/dev/MinoFlux`.
-- Path traversal and symlink escape outside each repo root are rejected.
-- No arbitrary shell tool is exposed.
-- Tests/benchmarks can execute only commands configured by the human.
-- Commands for the same repo are serialized; different repos/worktrees can run concurrently.
-- `config.toml` is reloaded automatically when changed.
-- v0.1 has no file-write tool yet.
-
-## Install
-
-```bash
-cd ~/dev/localdev-mcp
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+```text
+parent agent / local subagent
+        ↓
+LocalDev MCP
+        ↓
+managed git worktree
+        ↓
+read/search → patch → test → benchmark → diff
+        ↓
+commit or revert
 ```
 
-You do not have to edit TOML manually. Register a repo:
+## Safety model
 
-```bash
-python manage.py add minoflux 'F:\dev\MinoFlux'
-python manage.py list
+The important boundary is enforced in code rather than in prompts:
+
+- source repositories are read-only from write tools
+- write operations require a managed `job`
+- each job is an isolated Git worktree on a dedicated `localdev/*` branch
+- no arbitrary shell MCP tool
+- test/benchmark commands must be configured by the human
+- `shell=False`
+- path traversal and symlink escape are rejected
+- patches are size-limited and checked with `git apply --check`
+- `.git`, binary patches and submodule patches are rejected
+- same-job write/test/benchmark/Git operations are serialized
+- different jobs can run concurrently
+- `commit_job` never pushes
+- `revert_to_checkpoint` operates only inside the managed worktree
+
+v0.2 checkpoints intentionally require a **clean working tree and index**.
+
+## Setup
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+copy config.example.toml config.toml
+```
+
+Edit `config.toml` or register repos with the human-side manager.
+
+```powershell
+python manage.py add minoflux "F:\dev\MinoFlux"
+python manage.py set-command minoflux test "python -m pytest -q"
+python manage.py set-command minoflux benchmark "python tools/benchmark.py"
 python manage.py check
 ```
 
-Optional fixed commands:
+Set a job root in `config.toml`:
 
-```bash
-python manage.py set-command minoflux test "python -m pytest -q"
-python manage.py set-command minoflux benchmark "python benchmark.py"
+```toml
+[server]
+jobs_root = "F:\\dev\\localdev-jobs"
 ```
 
-## Human-side path management
-
-```bash
-python manage.py list
-python manage.py add NAME PATH
-python manage.py remove NAME
-python manage.py show NAME
-python manage.py path NAME NEW_PATH
-python manage.py check [NAME]
-python manage.py set-command NAME test "..."
-python manage.py set-command NAME benchmark "..."
-python manage.py clear-command NAME test
-python manage.py clear-command NAME benchmark
-```
-
-## Parallel worktrees
-
-For independent jobs on the same Git repo, create a worktree and register it as another repo root:
-
-```bash
-python manage.py worktree-add \
-  minoflux \
-  minoflux-job-001 \
-  'F:\dev\worktrees\MinoFlux-job-001' \
-  --new-branch ai/job-001
-```
-
-This helper is human-only; the model does not get permission to create arbitrary worktrees.
+`config.toml`, `jobs.json` and the JSONL operation log are ignored by Git.
 
 ## MCP tools
 
-- `list_repos()`
-- `repo_info(repo)`
-- `list_files(repo, path=".", recursive=false)`
-- `read_file(repo, path, start_line=1, end_line=null)`
-- `search_text(repo, query, path=".", case_sensitive=false)`
-- `git_status(repo)`
-- `git_diff(repo, staged=false)`
-- `run_tests(repo)`
-- `run_benchmark(repo)`
+Repository/read tools:
 
-## LM Studio
+- `list_repos`
+- `repo_info`
+- `list_files(repo=... | job=...)`
+- `read_file(path, repo=... | job=...)`
+- `search_text(query, repo=... | job=...)`
+- `git_status(repo=... | job=...)`
+- `git_diff(repo=... | job=...)`
 
-For a WSL project at `/home/kinetic_napier/dev/localdev-mcp`:
+Managed job tools:
 
-```json
-{
-  "mcpServers": {
-    "localdev": {
-      "command": "wsl.exe",
-      "args": [
-        "bash",
-        "-lc",
-        "cd /home/kinetic_napier/dev/localdev-mcp && exec .venv/bin/python server.py"
-      ]
-    }
-  }
-}
-```
+- `create_job(repo, name, base_ref=None)`
+- `list_jobs(repo=None)`
+- `job_info(job)`
+- `delete_job(job, force=False)`
+- `create_checkpoint(job)`
+- `apply_patch(job, patch)`
+- `run_tests(job)`
+- `run_benchmark(job)`
+- `revert_to_checkpoint(job, checkpoint)`
+- `commit_job(job, message)`
 
-## First test prompt
+There is intentionally no `write_file()` and no `run_command()`.
+
+## Example agent flow
 
 ```text
-Use list_repos first. Inspect the minoflux repository using list_files and read_file as needed. Do not modify anything. Explain what the repository does and report the configured test/benchmark commands.
+1. list_repos()
+2. create_job(repo="minoflux", name="qwen-001")
+3. create_checkpoint(job="qwen-001")
+4. read/search inside job qwen-001
+5. apply_patch(job="qwen-001", patch="...")
+6. run_tests(job="qwen-001")
+7. run_benchmark(job="qwen-001")
+8. git_diff(job="qwen-001")
+9a. commit_job(job="qwen-001", message="...")
+or
+9b. revert_to_checkpoint(job="qwen-001", checkpoint="...")
 ```
 
-## Concurrency
+## Human-side commands
 
-Different registered repo roots have different execution locks, so `run_tests` / `run_benchmark` can run in parallel across repos or worktrees. The same repo root is serialized to avoid build-directory collisions.
+```powershell
+python manage.py init
+python manage.py add <name> <path>
+python manage.py list
+python manage.py check
+python manage.py set-command <repo> test "<command>"
+python manage.py set-command <repo> benchmark "<command>"
+python manage.py jobs
+python manage.py job-remove <job> [--force]
+python manage.py cleanup-stale
+```
 
-For parallel AI experiments against one source repository, create separate Git worktrees and register them under different names.
+LM Studio/Polaris should normally launch `server.py` as a stdio MCP process.
 
-## Next
+## Parallelism
 
-v0.2: controlled `apply_patch`, checkpoint/revert, job lifecycle, benchmark acceptance rules, and automated candidate evaluation.
+A global active repo/job is deliberately not used.
+
+```text
+Qwen A → job-a
+Qwen B → job-b
+Qwen C → job-c
+```
+
+Different worktrees have separate locks, so they may run independently. One GPU may still make parallel model inference slower; this MCP only ensures the development workspaces themselves do not collide.
+
+## Tests
+
+```powershell
+pytest -q
+```
+
+The tests create temporary Git repositories/worktrees and cover:
+
+- traversal rejection
+- symlink escape rejection where the OS permits creating symlinks
+- patch isolation
+- invalid patch safety
+- checkpoint/revert
+- job branch commits
+- multiple repo loading
+
+## Notes
+
+`delete_job` preserves the job branch after removing the worktree. This is intentional: deleting a worktree should not silently destroy committed work. Branch cleanup can be done by the human after review.

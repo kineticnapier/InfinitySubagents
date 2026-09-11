@@ -19,6 +19,8 @@ CONFIG_PATH = HERE / "config.toml"
 READ_TOOLS = [
     "list_repos",
     "repo_info",
+    "list_jobs",
+    "job_info",
     "list_files",
     "read_file",
     "search_text",
@@ -26,7 +28,15 @@ READ_TOOLS = [
     "git_diff",
 ]
 
-CODE_TOOLS = []
+CODE_TOOLS = READ_TOOLS + [
+    "create_job",
+    "create_checkpoint",
+    "apply_patch",
+    "run_tests",
+    "run_benchmark",
+    "revert_to_checkpoint",
+    "commit_job",
+]
 
 
 @dataclass(frozen=True)
@@ -174,7 +184,7 @@ def build_chat_request(
         raise ValueError(f"Task exceeds {cfg.max_task_chars} characters")
     if mode not in {"research", "code"}:
         raise ValueError("mode must be 'research' or 'code'")
-    tools = list(READ_TOOLS) if mode == "research" else (_ for _ in ()).throw(RuntimeError("LocalDev v0.1.0 is read-only. Switch to v0.2.0 or newer for code mode."))
+    tools = _tools_for_mode(mode)
     out_cap = cfg.max_output_tokens if max_output_tokens is None else int(max_output_tokens)
     ctx = cfg.context_length if context_length is None else int(context_length)
     if out_cap < 1 or out_cap > cfg.max_output_tokens:
