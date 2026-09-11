@@ -11,7 +11,7 @@ Local Subagent MCP
     |
     | POST http://127.0.0.1:1234/api/v1/chat
     v
-LM Studio / Qwen
+LM Studio / local model
     |
     | integration: mcp/localdev
     v
@@ -45,7 +45,21 @@ cd local-subagent-mcp
 .\setup.ps1
 ```
 
-Edit `config.toml` and set `model` to the exact LM Studio model identifier.
+You do not need to edit `config.toml` just to change models. With the LM Studio API server running, select one interactively:
+
+```powershell
+.\.venv\Scripts\python.exe model_config.py select
+```
+
+Other model-management commands:
+
+```powershell
+.\.venv\Scripts\python.exe model_config.py list
+.\.venv\Scripts\python.exe model_config.py current
+.\.venv\Scripts\python.exe model_config.py set qwen/qwen3-14b
+```
+
+`set` verifies the exact model id against `/api/v1/models` before changing the config. `--force` skips that verification for recovery/offline configuration.
 
 Useful defaults for a single-GPU worker are already conservative:
 
@@ -58,7 +72,7 @@ The output cap is intentional: if the local model gets stuck in a reasoning loop
 
 ## 3. Register it in Codex
 
-After the venv exists:
+After the venv exists and a model is selected:
 
 ```powershell
 .\.venv\Scripts\python.exe install_codex.py --install
@@ -75,7 +89,7 @@ args = ["F:\\dev\\codex-free-subagents\\local-subagent-mcp\\server.py"]
 enabled = true
 ```
 
-Restart Codex after changing MCP configuration.
+Restart Codex after changing the MCP registration itself. Changing only the selected local model does **not** require a restart: `LocalAgentClient` reloads `config.toml` when it changes, so the next worker call uses the new model.
 
 ## MCP tools exposed to Codex
 
@@ -92,7 +106,7 @@ Arguments:
 - `max_output_tokens`: optional value up to the human-configured cap
 - `context_length`: optional value up to the human-configured cap
 
-`research` only exposes read-only LocalDev tools to Qwen.
+`research` only exposes read-only LocalDev tools to the local model.
 
 `code` additionally exposes controlled worktree operations: create job/checkpoint, apply patch, test, benchmark, revert and commit. `delete_job` is intentionally not delegated.
 
@@ -103,6 +117,21 @@ Continue a stored LM Studio response by passing the returned `response_id`.
 ### `local_agent_health`
 
 Checks LM Studio connectivity and reports the configured model/integration.
+
+### `local_agent_models`
+
+Lists the model ids currently returned by LM Studio and marks the model configured for the local worker.
+
+### `local_agent_set_model`
+
+Switches the local worker to an exact id returned by `local_agent_models`. It only rewrites `[lmstudio].model`; the next `local_agent` call reloads that setting automatically.
+
+Example parent-agent workflow:
+
+```text
+Call local_agent_models, switch to the requested model with local_agent_set_model,
+then run the same smoke test so I can compare tool accuracy and speed.
+```
 
 ## Suggested Codex usage
 
@@ -130,7 +159,8 @@ diff/result before deciding what to do next.
 
 ## Security boundaries
 
-- LM Studio URL/model/MCP integration are human-controlled config, not tool arguments.
+- LM Studio URL and MCP integration remain local configuration.
+- model switching is restricted to exact model ids currently returned by LM Studio unless the local CLI is explicitly run with `--force`.
 - remote LM Studio hosts are rejected by default.
 - research mode exposes only LocalDev read tools.
 - code mode still writes only through LocalDev's managed job/worktree boundary.
@@ -138,10 +168,9 @@ diff/result before deciding what to do next.
 - local reasoning and raw tool output are stripped before results return to Codex.
 - local worker concurrency defaults to 1 to avoid one GPU being thrashed by parallel parent subagents.
 
-
 ## Codex environment forwarding
 
-The installer now adds `env_vars = ["LM_API_TOKEN"]` to the Codex MCP entry.
+The installer adds `env_vars = ["LM_API_TOKEN"]` to the Codex MCP entry.
 Set `LM_API_TOKEN` before launching/restarting Codex. The token is not stored in this repository.
 
 If a local-agent request fails, the MCP tool returns the LM Studio HTTP error text in a structured `status=error` result instead of only surfacing a generic tool-execution failure.
