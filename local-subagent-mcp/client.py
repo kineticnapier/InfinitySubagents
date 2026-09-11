@@ -23,6 +23,7 @@ READ_TOOLS = [
     "list_jobs",
     "job_info",
     "list_files",
+    "find_files",
     "read_file",
     "search_text",
     "git_status",
@@ -32,9 +33,12 @@ READ_TOOLS = [
 CODE_TOOLS = READ_TOOLS + [
     "create_job",
     "create_checkpoint",
+    "write_text_file",
+    "replace_text",
     "apply_patch",
     "run_tests",
     "run_benchmark",
+    "revert_to_latest_checkpoint",
     "revert_to_checkpoint",
     "commit_job",
 ]
@@ -174,8 +178,13 @@ def build_system_prompt(mode: str, repo: str | None, job: str | None) -> str:
 
 Rules:
 - Never invent tool results.
+- Before guessing a file or path, inspect it with list_files or find_files.
+- Treat a tool result with ok=false as a real failure. Report its returned error_type/error; never invent an exception class.
 - Do not ask for an arbitrary shell tool; it is intentionally unavailable.
 - If a tool or configured command is unavailable, report that as a blocker instead of pretending it ran.
+- For a simple new text file prefer write_text_file. For one exact replacement in an existing text file prefer replace_text. Reserve apply_patch for edits that actually need a unified diff.
+- Prefer revert_to_latest_checkpoint unless an exact older checkpoint is explicitly required.
+- After any write/edit tool error, inspect git_status and git_diff before retrying the same write.
 - If the same approach fails twice, stop repeating it and reconsider assumptions or choose a different approach.
 - Keep the final answer compact. Report: status, what you found/changed, tests, benchmark (if any), and remaining risks/blockers.
 - The parent Codex agent receives your final answer and a compact tool trace; internal reasoning is intentionally not forwarded.
@@ -238,6 +247,12 @@ def _short_string(value: Any, limit: int = _TRACE_STRING_LIMIT) -> str:
     return text
 
 
+def _hash_text(value: Any) -> tuple[str, str]:
+    text = value if isinstance(value, str) else str(value)
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return text, digest
+
+
 def _compact_tool_arguments(arguments: Any) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         return {}
@@ -248,6 +263,7 @@ def _compact_tool_arguments(arguments: Any) -> dict[str, Any]:
         "path",
         "name",
         "query",
+        "pattern",
         "base_ref",
         "checkpoint",
         "start_line",
@@ -256,13 +272,20 @@ def _compact_tool_arguments(arguments: Any) -> dict[str, Any]:
         "case_sensitive",
         "staged",
         "force",
+        "overwrite",
     }
     for key, value in arguments.items():
         if key == "patch":
-            text = value if isinstance(value, str) else str(value)
+            text, digest = _hash_text(value)
             result["patch_chars"] = len(text)
             result["patch_lines"] = text.count("\n") + (1 if text else 0)
-            result["patch_sha256"] = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+            result["patch_sha256"] = digest
+        elif key in {"content", "old", "new"}:
+            text, digest = _hash_text(value)
+            result[f"{key}_chars"] = len(text)
+            result[f"{key}_sha256"] = digest
+            if key == "content":
+                result["content_ends_with_newline"] = text.endswith("\n")
         elif key == "message":
             result["message"] = _short_string(value, 120)
         elif key in safe_keys:
@@ -331,6 +354,19 @@ def _preview(text: Any, limit: int = _TRACE_PREVIEW_LIMIT) -> str:
 
 def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
     decoded = _decode_tool_output(raw)
+
+    if isinstance(decoded, dict) and decoded.get("ok") is False:
+        summary: dict[str, Any] = {"outcome": "error"}
+        if decoded.get("error_type") is not None:
+            summary["error_type"] = _short_string(decoded.get("error_type"), 120)
+        if decoded.get("error") is not None:
+            summary["error"] = _preview(decoded.get("error"), 400)
+        for key in ("repo", "job", "path", "checkpoint", "matches"):
+            if key in decoded:
+                value = decoded.get(key)
+                summary[key] = _short_string(value, 240) if isinstance(value, str) else value
+        return summary
+
     err = _error_text(decoded)
     if err is not None:
         return {"outcome": "error", "error": _preview(err, 400)}
@@ -343,7 +379,7 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             "output_preview": _preview(text, 300),
         }
 
-    summary: dict[str, Any] = {"outcome": "ok"}
+    summary = {"outcome": "ok"}
     if "exit_code" in decoded:
         summary["exit_code"] = decoded.get("exit_code")
         summary["outcome"] = "ok" if decoded.get("exit_code") == 0 else "error"
@@ -356,7 +392,18 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             summary["repos"] = [
                 item.get("name") for item in repos[:12] if isinstance(item, dict) and item.get("name")
             ]
-    elif tool in {"repo_info", "job_info", "create_job", "create_checkpoint", "revert_to_checkpoint", "commit_job", "apply_patch"}:
+    elif tool in {
+        "repo_info",
+        "job_info",
+        "create_job",
+        "create_checkpoint",
+        "revert_to_checkpoint",
+        "revert_to_latest_checkpoint",
+        "commit_job",
+        "apply_patch",
+        "write_text_file",
+        "replace_text",
+    }:
         for key in (
             "name",
             "job",
@@ -369,6 +416,12 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
             "commit",
             "paths",
             "diff_stat",
+            "status",
+            "chars",
+            "bytes",
+            "replacements",
+            "ends_with_newline",
+            "latest",
         ):
             if key in decoded:
                 value = decoded.get(key)
@@ -395,8 +448,27 @@ def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
                 for item in entries[:12]
                 if isinstance(item, dict)
             ]
+    elif tool == "find_files":
+        summary["target"] = decoded.get("target")
+        summary["pattern"] = _short_string(decoded.get("pattern"), 180)
+        results = decoded.get("results")
+        if isinstance(results, list):
+            summary["result_count"] = len(results)
+            summary["matches"] = [
+                _short_string(item.get("path"), 180)
+                for item in results[:12]
+                if isinstance(item, dict) and item.get("path")
+            ]
     elif tool == "read_file":
-        for key in ("target", "path", "start_line", "end_line", "total_lines"):
+        for key in (
+            "target",
+            "path",
+            "start_line",
+            "end_line",
+            "total_lines",
+            "ends_with_newline",
+            "source_ends_with_newline",
+        ):
             if key in decoded:
                 summary[key] = decoded.get(key)
         content = decoded.get("content")
