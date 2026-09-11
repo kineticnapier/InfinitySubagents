@@ -48,23 +48,78 @@ def test_caps_are_enforced():
         build_chat_request(cfg(), task="x", mode="code", context_length=9000)
 
 
-def test_response_drops_reasoning_and_raw_tool_outputs():
+def test_response_drops_reasoning_and_raw_tool_outputs_but_keeps_audit_trace():
     payload = {
         "model_instance_id": "qwen",
         "response_id": "resp_123",
         "output": [
             {"type": "reasoning", "content": "very long private scratchpad"},
-            {"type": "tool_call", "tool": "read_file", "arguments": {"path": "a"}, "output": "huge"},
-            {"type": "tool_call", "tool": "read_file", "arguments": {"path": "b"}, "output": "huge2"},
+            {
+                "type": "tool_call",
+                "tool": "read_file",
+                "arguments": {"path": "a.py", "repo": "demo"},
+                "output": '{"target":"demo","path":"a.py","start_line":1,"end_line":2,"total_lines":2,"content":"hello\\nworld"}',
+            },
+            {
+                "type": "tool_call",
+                "tool": "apply_patch",
+                "arguments": {"job": "j1", "patch": "SECRET PATCH BODY\n" * 100},
+                "output": '{"job":"j1","paths":["a.py"],"head":"abc","diff_stat":"1 file changed"}',
+            },
             {"type": "message", "content": "done"},
         ],
         "stats": {"input_tokens": 100, "total_output_tokens": 200, "tokens_per_second": 25.5},
     }
     result = compact_response(cfg(), payload)
     assert result["final"] == "done"
-    assert result["tool_calls"] == {"read_file": 2}
+    assert result["tool_calls"] == {"read_file": 1, "apply_patch": 1}
+    assert len(result["tool_trace"]) == 2
+    assert result["tool_trace"][0]["outcome"] == "ok"
+    assert result["tool_trace"][0]["path"] == "a.py"
+    assert result["tool_trace"][0]["content_preview"] == "hello\\nworld"
+    assert result["tool_trace"][1]["arguments"]["patch_chars"] > 0
+    assert "SECRET PATCH BODY" not in str(result)
     assert "private scratchpad" not in str(result)
-    assert "huge2" not in str(result)
+
+
+def test_tool_error_is_visible_to_parent():
+    payload = {
+        "output": [
+            {
+                "type": "tool_call",
+                "tool": "read_file",
+                "arguments": {"path": "missing.py", "repo": "demo"},
+                "output": "UnexpectedToolError: Error executing tool read_file: File does not exist",
+            },
+            {"type": "message", "content": "blocked"},
+        ]
+    }
+    result = compact_response(cfg(), payload)
+    trace = result["tool_trace"][0]
+    assert trace["tool"] == "read_file"
+    assert trace["arguments"]["path"] == "missing.py"
+    assert trace["outcome"] == "error"
+    assert "does not exist" in trace["error"]
+
+
+def test_git_status_preview_is_bounded_and_visible():
+    status = "## localdev/test\n?? LOCALDEV_SMOKE_TEST.txt\n"
+    payload = {
+        "output": [
+            {
+                "type": "tool_call",
+                "tool": "git_status",
+                "arguments": {"job": "smoke"},
+                "output": '{"exit_code":0,"stdout":"' + status.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"') + '","stderr":"","truncated":false}',
+            },
+            {"type": "message", "content": "done"},
+        ]
+    }
+    result = compact_response(cfg(), payload)
+    trace = result["tool_trace"][0]
+    assert trace["outcome"] == "ok"
+    assert trace["exit_code"] == 0
+    assert "LOCALDEV_SMOKE_TEST.txt" in trace["stdout_preview"]
 
 
 def test_bad_response_id_rejected():
