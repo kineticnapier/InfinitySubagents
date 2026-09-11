@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -37,6 +38,10 @@ CODE_TOOLS = READ_TOOLS + [
     "revert_to_checkpoint",
     "commit_job",
 ]
+
+_TRACE_MAX_ITEMS = 64
+_TRACE_STRING_LIMIT = 240
+_TRACE_PREVIEW_LIMIT = 800
 
 
 def _tools_for_mode(mode: str) -> list[str]:
@@ -226,9 +231,211 @@ def build_chat_request(
     return body
 
 
+def _short_string(value: Any, limit: int = _TRACE_STRING_LIMIT) -> str:
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    if len(text) > limit:
+        return text[:limit] + "...[truncated]"
+    return text
+
+
+def _compact_tool_arguments(arguments: Any) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return {}
+    result: dict[str, Any] = {}
+    safe_keys = {
+        "repo",
+        "job",
+        "path",
+        "name",
+        "query",
+        "base_ref",
+        "checkpoint",
+        "start_line",
+        "end_line",
+        "recursive",
+        "case_sensitive",
+        "staged",
+        "force",
+    }
+    for key, value in arguments.items():
+        if key == "patch":
+            text = value if isinstance(value, str) else str(value)
+            result["patch_chars"] = len(text)
+            result["patch_lines"] = text.count("\n") + (1 if text else 0)
+            result["patch_sha256"] = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+        elif key == "message":
+            result["message"] = _short_string(value, 120)
+        elif key in safe_keys:
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                result[key] = _short_string(value) if isinstance(value, str) else value
+            elif isinstance(value, list):
+                result[key] = [_short_string(v, 80) for v in value[:8]]
+    return result
+
+
+def _decode_tool_output(raw: Any) -> Any:
+    if not isinstance(raw, str):
+        return raw
+    text = raw.strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    # MCP transports commonly wrap a JSON result in [{"type":"text","text":"..."}].
+    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+        inner = parsed[0]
+        if inner.get("type") == "text" and isinstance(inner.get("text"), str):
+            nested = inner["text"].strip()
+            try:
+                return json.loads(nested)
+            except json.JSONDecodeError:
+                return nested
+    return parsed
+
+
+def _error_text(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("error", "message", "detail"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                low = candidate.lower()
+                if any(token in low for token in ("error", "failed", "failure", "exception", "does not exist", "not found")):
+                    return candidate
+        if value.get("isError") is True or value.get("is_error") is True:
+            return _short_string(value, 400)
+        return None
+    if isinstance(value, str):
+        low = value.lower()
+        markers = (
+            "unexpectedtoolerror",
+            "error executing tool",
+            "tool call failed",
+            "traceback",
+            "exception:",
+            "file does not exist",
+            "path does not exist",
+        )
+        if any(marker in low for marker in markers):
+            return value
+    return None
+
+
+def _preview(text: Any, limit: int = _TRACE_PREVIEW_LIMIT) -> str:
+    if text is None:
+        return ""
+    return _short_string(text, limit)
+
+
+def _compact_tool_output(tool: str, raw: Any) -> dict[str, Any]:
+    decoded = _decode_tool_output(raw)
+    err = _error_text(decoded)
+    if err is not None:
+        return {"outcome": "error", "error": _preview(err, 400)}
+
+    if not isinstance(decoded, dict):
+        text = decoded if isinstance(decoded, str) else json.dumps(decoded, ensure_ascii=False, default=str)
+        return {
+            "outcome": "unknown",
+            "output_chars": len(text),
+            "output_preview": _preview(text, 300),
+        }
+
+    summary: dict[str, Any] = {"outcome": "ok"}
+    if "exit_code" in decoded:
+        summary["exit_code"] = decoded.get("exit_code")
+        summary["outcome"] = "ok" if decoded.get("exit_code") == 0 else "error"
+    if "truncated" in decoded:
+        summary["truncated"] = bool(decoded.get("truncated"))
+
+    if tool == "list_repos":
+        repos = decoded.get("repos")
+        if isinstance(repos, list):
+            summary["repos"] = [
+                item.get("name") for item in repos[:12] if isinstance(item, dict) and item.get("name")
+            ]
+    elif tool in {"repo_info", "job_info", "create_job", "create_checkpoint", "revert_to_checkpoint", "commit_job", "apply_patch"}:
+        for key in (
+            "name",
+            "job",
+            "source_repo",
+            "path",
+            "branch",
+            "base_ref",
+            "head",
+            "checkpoint",
+            "commit",
+            "paths",
+            "diff_stat",
+        ):
+            if key in decoded:
+                value = decoded.get(key)
+                if isinstance(value, str):
+                    summary[key] = _short_string(value, 300)
+                elif isinstance(value, list):
+                    summary[key] = [_short_string(v, 120) for v in value[:12]]
+                elif isinstance(value, (int, float, bool)) or value is None:
+                    summary[key] = value
+    elif tool == "list_jobs":
+        jobs = decoded.get("jobs")
+        if isinstance(jobs, list):
+            summary["jobs"] = [
+                item.get("name") for item in jobs[:12] if isinstance(item, dict) and item.get("name")
+            ]
+    elif tool == "list_files":
+        entries = decoded.get("entries")
+        summary["target"] = decoded.get("target")
+        summary["base"] = decoded.get("base")
+        if isinstance(entries, list):
+            summary["entry_count"] = len(entries)
+            summary["entries"] = [
+                {"path": _short_string(item.get("path"), 160), "type": item.get("type")}
+                for item in entries[:12]
+                if isinstance(item, dict)
+            ]
+    elif tool == "read_file":
+        for key in ("target", "path", "start_line", "end_line", "total_lines"):
+            if key in decoded:
+                summary[key] = decoded.get(key)
+        content = decoded.get("content")
+        if isinstance(content, str):
+            summary["content_chars"] = len(content)
+            summary["content_sha256"] = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+            summary["content_preview"] = _preview(content, 360)
+    elif tool == "search_text":
+        for key in ("target", "query"):
+            if key in decoded:
+                summary[key] = _short_string(decoded.get(key), 180)
+        results = decoded.get("results")
+        if isinstance(results, list):
+            summary["result_count"] = len(results)
+            summary["matches"] = [
+                {"path": _short_string(item.get("path"), 160), "line": item.get("line")}
+                for item in results[:12]
+                if isinstance(item, dict)
+            ]
+    elif tool in {"git_status", "git_diff", "run_tests", "run_benchmark"}:
+        stdout = decoded.get("stdout")
+        stderr = decoded.get("stderr")
+        if isinstance(stdout, str):
+            summary["stdout_chars"] = len(stdout)
+            summary["stdout_sha256"] = hashlib.sha256(stdout.encode("utf-8", errors="replace")).hexdigest()[:16]
+            summary["stdout_preview"] = _preview(stdout, 1200 if tool == "git_diff" else 800)
+        if isinstance(stderr, str) and stderr:
+            summary["stderr_chars"] = len(stderr)
+            summary["stderr_preview"] = _preview(stderr, 500)
+    else:
+        summary["keys"] = sorted(str(key) for key in decoded.keys())[:20]
+
+    return summary
+
+
 def compact_response(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
     messages: list[str] = []
     tool_names: list[str] = []
+    tool_trace: list[dict[str, Any]] = []
     invalid_calls: list[dict[str, Any]] = []
 
     for item in payload.get("output", []) or []:
@@ -242,6 +449,14 @@ def compact_response(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
         elif typ == "tool_call":
             name = str(item.get("tool", "?"))
             tool_names.append(name)
+            if len(tool_trace) < _TRACE_MAX_ITEMS:
+                tool_trace.append(
+                    {
+                        "tool": name,
+                        "arguments": _compact_tool_arguments(item.get("arguments")),
+                        **_compact_tool_output(name, item.get("output")),
+                    }
+                )
         elif typ == "invalid_tool_call":
             invalid_calls.append(
                 {
@@ -249,8 +464,8 @@ def compact_response(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
                     "reason": item.get("reason"),
                 }
             )
-        # Intentionally drop `reasoning` and tool outputs. They can be huge and the
-        # parent agent only needs the worker's result plus a compact execution trace.
+        # Intentionally drop hidden reasoning and full raw tool outputs. The parent
+        # receives a bounded audit trace containing arguments and compact summaries.
 
     final_message = messages[-1] if messages else ""
     if len(final_message) > cfg.max_result_chars:
@@ -267,6 +482,8 @@ def compact_response(cfg: Config, payload: dict[str, Any]) -> dict[str, Any]:
         "model_instance_id": payload.get("model_instance_id"),
         "final": final_message,
         "tool_calls": counts,
+        "tool_trace": tool_trace,
+        "tool_trace_truncated": len(tool_names) > len(tool_trace),
         "invalid_tool_calls": invalid_calls[:20],
         "stats": {
             k: stats.get(k)
