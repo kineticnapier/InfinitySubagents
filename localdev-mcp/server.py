@@ -49,19 +49,68 @@ DESTRUCTIVE = ToolAnnotations(
     open_world_hint=False,
 )
 
+# LLM-facing outputs must stay well below the model context window. Human-configured
+# limits remain hard upper bounds, but these smaller caps prevent a single broad
+# search/read/diff from flooding LM Studio's conversation history.
+_LIST_RESULT_LIMIT = 100
+_FIND_RESULT_LIMIT = 40
+_SEARCH_RESULT_LIMIT = 30
+_SEARCH_SNIPPET_CHARS = 240
+_READ_LINE_LIMIT = 160
+_GIT_OUTPUT_BYTES = 16 * 1024
+_EXEC_OUTPUT_BYTES = 24 * 1024
+
 
 def _error(error_type: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"ok": False, "error_type": error_type, "error": message, **extra}
 
 
+def _resolve_target_compat(
+    *, repo: str | None, job: str | None
+) -> tuple[str, Path, Any, Any] | dict[str, Any]:
+    """Resolve source/job targets while tolerating a redundant matching repo+job pair.
+
+    Small local models frequently pass both fields after a job has been created. If
+    they agree, prefer the job worktree. If they disagree, return a structured error.
+    """
+    if job:
+        try:
+            j = state.job(job)
+        except (ValueError, RuntimeError) as e:
+            return _error("unknown_job", str(e), job=job)
+        if repo is not None and repo != j.source_repo:
+            return _error(
+                "target_conflict",
+                f"Job {job!r} belongs to repo {j.source_repo!r}, not {repo!r}",
+                repo=repo,
+                job=job,
+                source_repo=j.source_repo,
+            )
+        try:
+            return resolve_target(state, job=job)
+        except (ValueError, RuntimeError) as e:
+            return _error("invalid_target", str(e), job=job)
+
+    if repo:
+        try:
+            return resolve_target(state, repo=repo)
+        except (ValueError, RuntimeError) as e:
+            return _error("invalid_target", str(e), repo=repo)
+
+    return _error("invalid_target", "Specify repo or job")
+
+
 def _resolve_read_target(
     *, repo: str | None, job: str | None, path: str
 ) -> tuple[str, Path, Path] | dict[str, Any]:
+    resolved = _resolve_target_compat(repo=repo, job=job)
+    if isinstance(resolved, dict):
+        return {**resolved, "path": path}
+    name, root, _, _ = resolved
     try:
-        name, root, _, _ = resolve_target(state, repo=repo, job=job)
         target = safe_path(root, path)
     except (ValueError, RuntimeError) as e:
-        return _error("invalid_target", str(e), path=path)
+        return _error("invalid_target", str(e), target=name, path=path)
     return name, root, target
 
 
@@ -77,6 +126,10 @@ def _managed_text_target(job: str, path: str) -> tuple[Any, Path, Path] | dict[s
     if not parts or any(part.lower() == ".git" for part in parts):
         return _error("forbidden_path", ".git paths are not writable", job=job, path=path)
     return j, root, target
+
+
+def _model_output_cap(configured: int, safe_cap: int) -> int:
+    return max(1024, min(configured, safe_cap))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -117,9 +170,13 @@ def repo_info(repo: str) -> dict[str, Any]:
 @mcp.tool(annotations=READ_ONLY)
 def list_jobs(repo: str | None = None) -> dict[str, Any]:
     jobs = []
+    truncated = False
     for j in state.list_jobs():
         if repo is not None and j.source_repo != repo:
             continue
+        if len(jobs) >= _LIST_RESULT_LIMIT:
+            truncated = True
+            break
         p = Path(j.path)
         jobs.append(
             {
@@ -132,7 +189,7 @@ def list_jobs(repo: str | None = None) -> dict[str, Any]:
                 "checkpoints": list(j.checkpoints),
             }
         )
-    return {"ok": True, "jobs": jobs}
+    return {"ok": True, "jobs": jobs, "returned": len(jobs), "truncated": truncated}
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -191,33 +248,39 @@ def list_files(
         return _error("not_directory", "Path is not a directory", target=name, path=path)
 
     cfg = state.server
+    limit = min(cfg.max_list_entries, _LIST_RESULT_LIMIT)
     entries: list[dict[str, str]] = []
+    truncated = False
     if recursive:
         for item in iter_files(root, base, cfg.ignore_dirs):
-            entries.append({"path": rel(root, item), "type": "file"})
-            if len(entries) >= cfg.max_list_entries:
+            if len(entries) >= limit:
+                truncated = True
                 break
+            entries.append({"path": rel(root, item), "type": "file"})
     else:
         for item in sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
             try:
                 item.resolve().relative_to(root.resolve())
             except (OSError, ValueError):
                 continue
+            if len(entries) >= limit:
+                truncated = True
+                break
             entries.append(
                 {
                     "path": rel(root, item),
                     "type": "directory" if item.is_dir() else "file",
                 }
             )
-            if len(entries) >= cfg.max_list_entries:
-                break
 
     return {
         "ok": True,
         "target": name,
         "base": rel(root, base),
         "entries": entries,
-        "truncated": len(entries) >= cfg.max_list_entries,
+        "returned": len(entries),
+        "truncated": truncated,
+        "next_hint": "narrow path or use find_files/search_text" if truncated else None,
     }
 
 
@@ -242,29 +305,28 @@ def find_files(
         return _error("not_directory", "Path is not a directory", target=name, path=path)
 
     cfg = state.server
+    limit = min(cfg.max_search_results, _FIND_RESULT_LIMIT)
     needle = pattern if case_sensitive else pattern.casefold()
     match_full_path = "/" in pattern or "\\" in pattern
     results: list[dict[str, str]] = []
+    truncated = False
     for file in iter_files(root, base, cfg.ignore_dirs):
         relative = rel(root, file)
         candidate = relative if match_full_path else file.name
         haystack = candidate if case_sensitive else candidate.casefold()
         if fnmatch.fnmatchcase(haystack, needle):
+            if len(results) >= limit:
+                truncated = True
+                break
             results.append({"path": relative})
-            if len(results) >= cfg.max_search_results:
-                return {
-                    "ok": True,
-                    "target": name,
-                    "pattern": pattern,
-                    "results": results,
-                    "truncated": True,
-                }
     return {
         "ok": True,
         "target": name,
         "pattern": pattern,
         "results": results,
-        "truncated": False,
+        "returned": len(results),
+        "truncated": truncated,
+        "next_hint": "narrow pattern or path" if truncated else None,
     }
 
 
@@ -303,12 +365,15 @@ def read_file(
             start_line=start_line,
             end_line=end_line,
         )
+
     start = start_line - 1
-    end = len(lines) if end_line is None else min(end_line, len(lines))
+    requested_end = len(lines) if end_line is None else min(end_line, len(lines))
+    end = min(requested_end, start + _READ_LINE_LIMIT)
     selected = lines[start:end]
     content = "\n".join(selected)
     if selected and end == len(lines) and raw_text.endswith("\n"):
         content += "\n"
+    truncated = end < requested_end
     return {
         "ok": True,
         "target": name,
@@ -319,6 +384,9 @@ def read_file(
         "content": content,
         "ends_with_newline": content.endswith("\n"),
         "source_ends_with_newline": raw_text.endswith("\n"),
+        "truncated": truncated,
+        "next_start_line": end + 1 if truncated else None,
+        "next_hint": "read_file again from next_start_line" if truncated else None,
     }
 
 
@@ -340,8 +408,10 @@ def search_text(
         return _error("path_not_found", "Path does not exist", target=name, path=path)
 
     cfg = state.server
+    limit = min(cfg.max_search_results, _SEARCH_RESULT_LIMIT)
     needle = query if case_sensitive else query.casefold()
     results: list[dict[str, Any]] = []
+    truncated = False
     for file in iter_files(root, base, cfg.ignore_dirs):
         try:
             if file.stat().st_size > cfg.max_read_bytes or is_probably_binary(file):
@@ -352,38 +422,43 @@ def search_text(
         for line_no, line in enumerate(lines, 1):
             haystack = line if case_sensitive else line.casefold()
             if needle in haystack:
-                results.append({"path": rel(root, file), "line": line_no, "text": line[:1000]})
-                if len(results) >= cfg.max_search_results:
-                    return {
-                        "ok": True,
-                        "target": name,
-                        "query": query,
-                        "results": results,
-                        "truncated": True,
+                if len(results) >= limit:
+                    truncated = True
+                    break
+                results.append(
+                    {
+                        "path": rel(root, file),
+                        "line": line_no,
+                        "text": line[:_SEARCH_SNIPPET_CHARS],
                     }
+                )
+        if truncated:
+            break
     return {
         "ok": True,
         "target": name,
         "query": query,
         "results": results,
-        "truncated": False,
+        "returned": len(results),
+        "truncated": truncated,
+        "next_hint": "narrow query or path before searching again" if truncated else None,
     }
 
 
 @mcp.tool(annotations=READ_ONLY)
 def git_status(repo: str | None = None, job: str | None = None) -> dict[str, Any]:
-    try:
-        _, root, _, j = resolve_target(state, repo=repo, job=job)
-    except (ValueError, RuntimeError) as e:
-        return _error("invalid_target", str(e))
+    resolved = _resolve_target_compat(repo=repo, job=job)
+    if isinstance(resolved, dict):
+        return resolved
+    _, root, r, j = resolved
     cfg = state.server
-    lock = state.job_lock(j.name) if j else state.repo_lock(str(repo))
+    lock = state.job_lock(j.name) if j else state.repo_lock(r.name)
     with lock:
         result = git(
             root,
             ["status", "--short", "--branch"],
             timeout=cfg.command_timeout_seconds,
-            max_output_bytes=cfg.max_output_bytes,
+            max_output_bytes=_model_output_cap(cfg.max_output_bytes, _GIT_OUTPUT_BYTES),
         )
     return {"ok": result.get("exit_code") == 0, **result}
 
@@ -394,12 +469,12 @@ def git_diff(
     job: str | None = None,
     staged: bool = False,
 ) -> dict[str, Any]:
-    try:
-        _, root, _, j = resolve_target(state, repo=repo, job=job)
-    except (ValueError, RuntimeError) as e:
-        return _error("invalid_target", str(e))
+    resolved = _resolve_target_compat(repo=repo, job=job)
+    if isinstance(resolved, dict):
+        return resolved
+    _, root, r, j = resolved
     cfg = state.server
-    lock = state.job_lock(j.name) if j else state.repo_lock(str(repo))
+    lock = state.job_lock(j.name) if j else state.repo_lock(r.name)
     command = ["diff"]
     if staged:
         command.append("--cached")
@@ -409,7 +484,7 @@ def git_diff(
             root,
             command,
             timeout=cfg.command_timeout_seconds,
-            max_output_bytes=cfg.max_output_bytes,
+            max_output_bytes=_model_output_cap(cfg.max_output_bytes, _GIT_OUTPUT_BYTES),
         )
     return {"ok": result.get("exit_code") == 0, **result}
 
@@ -432,7 +507,7 @@ def _run_fixed(job: str, kind: str) -> dict[str, Any]:
             list(command),
             cwd=root,
             timeout=cfg.command_timeout_seconds,
-            max_output_bytes=cfg.max_output_bytes,
+            max_output_bytes=_model_output_cap(cfg.max_output_bytes, _EXEC_OUTPUT_BYTES),
         )
         after = git_text(root, ["rev-parse", "HEAD"])
     state.log(
