@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import fnmatch
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -49,20 +51,96 @@ DESTRUCTIVE = ToolAnnotations(
     open_world_hint=False,
 )
 
-# LLM-facing outputs must stay well below the model context window. Human-configured
-# limits remain hard upper bounds, but these smaller caps prevent a single broad
-# search/read/diff from flooding LM Studio's conversation history.
+# LLM-facing outputs must stay comfortably below an 8k context window. The
+# human-configured limits are still hard upper bounds, but these smaller budgets
+# prevent a single broad tool result from flooding LM Studio's conversation state.
 _LIST_RESULT_LIMIT = 100
 _FIND_RESULT_LIMIT = 40
 _SEARCH_RESULT_LIMIT = 30
 _SEARCH_SNIPPET_CHARS = 240
 _READ_LINE_LIMIT = 160
-_GIT_OUTPUT_BYTES = 16 * 1024
-_EXEC_OUTPUT_BYTES = 24 * 1024
+_READ_CHAR_LIMIT = 6_000
+_COLLECTION_CHAR_LIMIT = 6_000
+_GIT_OUTPUT_BYTES = 8 * 1024
+_EXEC_OUTPUT_BYTES = 12 * 1024
+_GIT_RESULT_CHAR_LIMIT = 6_000
+_EXEC_RESULT_CHAR_LIMIT = 8_000
+_REPEAT_WINDOW_SECONDS = 45.0
+_REPEAT_MAX_IDENTICAL = 2
+
+_repeat_guard_lock = threading.Lock()
+_repeat_guard: dict[tuple[Any, ...], tuple[int, float]] = {}
 
 
 def _error(error_type: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"ok": False, "error_type": error_type, "error": message, **extra}
+
+
+def _json_chars(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _append_bounded(
+    items: list[dict[str, Any]],
+    item: dict[str, Any],
+    used_chars: int,
+    char_limit: int = _COLLECTION_CHAR_LIMIT,
+) -> tuple[int, bool]:
+    """Append one JSON-shaped item if it fits the aggregate LLM output budget."""
+    size = _json_chars(item)
+    if size > char_limit or used_chars + size > char_limit:
+        return used_chars, False
+    items.append(item)
+    return used_chars + size, True
+
+
+def _bound_process_result(result: dict[str, Any], char_limit: int) -> dict[str, Any]:
+    """Bound stdout+stderr together, not independently, before returning to the model."""
+    bounded = dict(result)
+    stdout = str(bounded.get("stdout") or "")
+    stderr = str(bounded.get("stderr") or "")
+    original_chars = len(stdout) + len(stderr)
+
+    out = stdout[:char_limit]
+    remaining = max(0, char_limit - len(out))
+    err = stderr[:remaining]
+    bounded["stdout"] = out
+    bounded["stderr"] = err
+    bounded["output_chars"] = len(out) + len(err)
+    if original_chars > bounded["output_chars"]:
+        bounded["truncated"] = True
+        bounded["output_truncated_by_mcp"] = True
+    return bounded
+
+
+def _guard_identical_call(tool: str, key: tuple[Any, ...]) -> dict[str, Any] | None:
+    """Stop fast exact-call loops while allowing normal pagination and changed files."""
+    now = time.monotonic()
+    guard_key = (tool, *key)
+    with _repeat_guard_lock:
+        # Keep the tiny in-memory guard bounded and discard stale entries.
+        if len(_repeat_guard) > 256:
+            stale_before = now - (_REPEAT_WINDOW_SECONDS * 2)
+            for candidate, (_, last_seen) in list(_repeat_guard.items()):
+                if last_seen < stale_before:
+                    _repeat_guard.pop(candidate, None)
+
+        previous = _repeat_guard.get(guard_key)
+        if previous is None or now - previous[1] > _REPEAT_WINDOW_SECONDS:
+            count = 1
+        else:
+            count = previous[0] + 1
+        _repeat_guard[guard_key] = (count, now)
+
+    if count <= _REPEAT_MAX_IDENTICAL:
+        return None
+    return _error(
+        "repeated_call",
+        "Identical tool call repeated too quickly; advance pagination, narrow the request, or stop and summarize.",
+        tool=tool,
+        repeats=count,
+        retry_after_seconds=int(_REPEAT_WINDOW_SECONDS),
+    )
 
 
 def _resolve_target_compat(
@@ -169,8 +247,9 @@ def repo_info(repo: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ_ONLY)
 def list_jobs(repo: str | None = None) -> dict[str, Any]:
-    jobs = []
+    jobs: list[dict[str, Any]] = []
     truncated = False
+    used_chars = 0
     for j in state.list_jobs():
         if repo is not None and j.source_repo != repo:
             continue
@@ -178,18 +257,27 @@ def list_jobs(repo: str | None = None) -> dict[str, Any]:
             truncated = True
             break
         p = Path(j.path)
-        jobs.append(
-            {
-                "name": j.name,
-                "source_repo": j.source_repo,
-                "path": j.path,
-                "branch": j.branch,
-                "base_ref": j.base_ref,
-                "exists": p.is_dir(),
-                "checkpoints": list(j.checkpoints),
-            }
-        )
-    return {"ok": True, "jobs": jobs, "returned": len(jobs), "truncated": truncated}
+        item = {
+            "name": j.name,
+            "source_repo": j.source_repo,
+            "path": j.path,
+            "branch": j.branch,
+            "base_ref": j.base_ref,
+            "exists": p.is_dir(),
+            "checkpoints": list(j.checkpoints),
+        }
+        used_chars, appended = _append_bounded(jobs, item, used_chars)
+        if not appended:
+            truncated = True
+            break
+    return {
+        "ok": True,
+        "jobs": jobs,
+        "returned": len(jobs),
+        "result_chars": used_chars,
+        "truncated": truncated,
+        "next_hint": "filter list_jobs by repo" if truncated else None,
+    }
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -249,14 +337,19 @@ def list_files(
 
     cfg = state.server
     limit = min(cfg.max_list_entries, _LIST_RESULT_LIMIT)
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
+    used_chars = 0
     truncated = False
     if recursive:
         for item in iter_files(root, base, cfg.ignore_dirs):
             if len(entries) >= limit:
                 truncated = True
                 break
-            entries.append({"path": rel(root, item), "type": "file"})
+            entry = {"path": rel(root, item), "type": "file"}
+            used_chars, appended = _append_bounded(entries, entry, used_chars)
+            if not appended:
+                truncated = True
+                break
     else:
         for item in sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
             try:
@@ -266,12 +359,14 @@ def list_files(
             if len(entries) >= limit:
                 truncated = True
                 break
-            entries.append(
-                {
-                    "path": rel(root, item),
-                    "type": "directory" if item.is_dir() else "file",
-                }
-            )
+            entry = {
+                "path": rel(root, item),
+                "type": "directory" if item.is_dir() else "file",
+            }
+            used_chars, appended = _append_bounded(entries, entry, used_chars)
+            if not appended:
+                truncated = True
+                break
 
     return {
         "ok": True,
@@ -279,6 +374,7 @@ def list_files(
         "base": rel(root, base),
         "entries": entries,
         "returned": len(entries),
+        "result_chars": used_chars,
         "truncated": truncated,
         "next_hint": "narrow path or use find_files/search_text" if truncated else None,
     }
@@ -308,7 +404,8 @@ def find_files(
     limit = min(cfg.max_search_results, _FIND_RESULT_LIMIT)
     needle = pattern if case_sensitive else pattern.casefold()
     match_full_path = "/" in pattern or "\\" in pattern
-    results: list[dict[str, str]] = []
+    results: list[dict[str, Any]] = []
+    used_chars = 0
     truncated = False
     for file in iter_files(root, base, cfg.ignore_dirs):
         relative = rel(root, file)
@@ -318,13 +415,18 @@ def find_files(
             if len(results) >= limit:
                 truncated = True
                 break
-            results.append({"path": relative})
+            entry = {"path": relative}
+            used_chars, appended = _append_bounded(results, entry, used_chars)
+            if not appended:
+                truncated = True
+                break
     return {
         "ok": True,
         "target": name,
         "pattern": pattern,
         "results": results,
         "returned": len(results),
+        "result_chars": used_chars,
         "truncated": truncated,
         "next_hint": "narrow pattern or path" if truncated else None,
     }
@@ -337,7 +439,13 @@ def read_file(
     job: str | None = None,
     start_line: int = 1,
     end_line: int | None = None,
+    start_char: int = 0,
 ) -> dict[str, Any]:
+    """Read a bounded UTF-8 text page.
+
+    If truncated, follow next_start_char first with the same line range; when that is
+    null, continue from next_start_line. Do not repeat an identical successful call.
+    """
     resolved = _resolve_read_target(repo=repo, job=job, path=path)
     if isinstance(resolved, dict):
         return resolved
@@ -352,6 +460,14 @@ def read_file(
         return _error("file_too_large", "File too large", target=name, path=path)
     if is_probably_binary(target):
         return _error("binary_file", "Binary file reading is disabled", target=name, path=path)
+    if start_char < 0:
+        return _error(
+            "invalid_char_offset",
+            "start_char must be >= 0",
+            target=name,
+            path=path,
+            start_char=start_char,
+        )
 
     raw_text = target.read_text(encoding="utf-8", errors="replace")
     lines = raw_text.splitlines()
@@ -370,10 +486,48 @@ def read_file(
     requested_end = len(lines) if end_line is None else min(end_line, len(lines))
     end = min(requested_end, start + _READ_LINE_LIMIT)
     selected = lines[start:end]
-    content = "\n".join(selected)
+    window = "\n".join(selected)
     if selected and end == len(lines) and raw_text.endswith("\n"):
-        content += "\n"
-    truncated = end < requested_end
+        window += "\n"
+
+    if start_char > len(window):
+        return _error(
+            "invalid_char_offset",
+            "start_char is beyond the selected read window",
+            target=name,
+            path=path,
+            start_line=start_line,
+            end_line=end,
+            start_char=start_char,
+            window_chars=len(window),
+        )
+
+    try:
+        mtime_ns = target.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    guard = _guard_identical_call(
+        "read_file",
+        (name, rel(root, target), mtime_ns, start_line, end_line, start_char),
+    )
+    if guard is not None:
+        return {**guard, "target": name, "path": rel(root, target)}
+
+    content = window[start_char : start_char + _READ_CHAR_LIMIT]
+    next_char = start_char + len(content)
+    char_truncated = next_char < len(window)
+    line_truncated = end < requested_end
+    truncated = char_truncated or line_truncated
+    next_start_char = next_char if char_truncated else None
+    next_start_line = end + 1 if (not char_truncated and line_truncated) else None
+
+    if char_truncated:
+        next_hint = "read_file again with the same start_line/end_line and start_char=next_start_char"
+    elif line_truncated:
+        next_hint = "read_file again from next_start_line with start_char=0"
+    else:
+        next_hint = None
+
     return {
         "ok": True,
         "target": name,
@@ -381,12 +535,19 @@ def read_file(
         "start_line": start + 1,
         "end_line": start + len(selected),
         "total_lines": len(lines),
+        "start_char": start_char,
+        "end_char": next_char,
+        "window_chars": len(window),
+        "content_chars": len(content),
         "content": content,
         "ends_with_newline": content.endswith("\n"),
         "source_ends_with_newline": raw_text.endswith("\n"),
         "truncated": truncated,
-        "next_start_line": end + 1 if truncated else None,
-        "next_hint": "read_file again from next_start_line" if truncated else None,
+        "truncated_by_chars": char_truncated,
+        "truncated_by_lines": line_truncated,
+        "next_start_char": next_start_char,
+        "next_start_line": next_start_line,
+        "next_hint": next_hint,
     }
 
 
@@ -411,6 +572,7 @@ def search_text(
     limit = min(cfg.max_search_results, _SEARCH_RESULT_LIMIT)
     needle = query if case_sensitive else query.casefold()
     results: list[dict[str, Any]] = []
+    used_chars = 0
     truncated = False
     for file in iter_files(root, base, cfg.ignore_dirs):
         try:
@@ -425,13 +587,15 @@ def search_text(
                 if len(results) >= limit:
                     truncated = True
                     break
-                results.append(
-                    {
-                        "path": rel(root, file),
-                        "line": line_no,
-                        "text": line[:_SEARCH_SNIPPET_CHARS],
-                    }
-                )
+                entry = {
+                    "path": rel(root, file),
+                    "line": line_no,
+                    "text": line[:_SEARCH_SNIPPET_CHARS],
+                }
+                used_chars, appended = _append_bounded(results, entry, used_chars)
+                if not appended:
+                    truncated = True
+                    break
         if truncated:
             break
     return {
@@ -440,6 +604,7 @@ def search_text(
         "query": query,
         "results": results,
         "returned": len(results),
+        "result_chars": used_chars,
         "truncated": truncated,
         "next_hint": "narrow query or path before searching again" if truncated else None,
     }
@@ -460,7 +625,7 @@ def git_status(repo: str | None = None, job: str | None = None) -> dict[str, Any
             timeout=cfg.command_timeout_seconds,
             max_output_bytes=_model_output_cap(cfg.max_output_bytes, _GIT_OUTPUT_BYTES),
         )
-    return {"ok": result.get("exit_code") == 0, **result}
+    return {"ok": result.get("exit_code") == 0, **_bound_process_result(result, _GIT_RESULT_CHAR_LIMIT)}
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -486,7 +651,7 @@ def git_diff(
             timeout=cfg.command_timeout_seconds,
             max_output_bytes=_model_output_cap(cfg.max_output_bytes, _GIT_OUTPUT_BYTES),
         )
-    return {"ok": result.get("exit_code") == 0, **result}
+    return {"ok": result.get("exit_code") == 0, **_bound_process_result(result, _GIT_RESULT_CHAR_LIMIT)}
 
 
 def _run_fixed(job: str, kind: str) -> dict[str, Any]:
@@ -519,7 +684,7 @@ def _run_fixed(job: str, kind: str) -> dict[str, Any]:
         before_head=before,
         after_head=after,
     )
-    return {"ok": result.get("exit_code") == 0, **result}
+    return {"ok": result.get("exit_code") == 0, **_bound_process_result(result, _EXEC_RESULT_CHAR_LIMIT)}
 
 
 @mcp.tool(annotations=LOCAL_EXEC)
