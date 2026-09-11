@@ -1,0 +1,13 @@
+[server]
+command_timeout_seconds = 300
+max_output_bytes = 65536
+max_read_bytes = 262144
+max_list_entries = 1000
+max_search_results = 200
+ignore_dirs = [".git", ".venv", "node_modules", "__pycache__", "bin", "obj", "target", "dist", "build"]
+
+# Register as many repos/worktrees as you want.
+[repos.example]
+path = "/mnt/f/dev/example"
+test_command = ["python", "-m", "pytest", "-q"]
+benchmark_command = ["python", "benchmark.py"]

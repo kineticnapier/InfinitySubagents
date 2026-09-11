@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+Thumbs.db
+.DS_Store
+
+localdev-mcp/config.toml
+localdev-mcp/jobs.json
+localdev-mcp/*.log
+localdev-mcp/*.jsonl
+
+local-subagent-mcp/config.toml

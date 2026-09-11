@@ -1,0 +1,30 @@
+[lmstudio]
+base_url = "http://127.0.0.1:1234"
+
+# Set this to the exact model identifier shown by LM Studio's API.
+model = "CHANGE_ME"
+
+# This is the LocalDev MCP server id from LM Studio's mcp.json.
+integration_id = "mcp/localdev"
+
+# Keep one generation at a time on a single consumer GPU unless you have a reason
+# to allow more. Separate LocalDev worktrees can still run independently.
+max_parallel = 1
+
+timeout_seconds = 900
+context_length = 8192
+max_output_tokens = 4096
+temperature = 0.2
+
+# Empty = let LM Studio/model choose. Other accepted values:
+# off, low, medium, high, on
+reasoning = ""
+
+# If LM Studio API auth is enabled, put the token in this environment variable.
+token_env = "LM_API_TOKEN"
+
+max_task_chars = 50000
+max_result_chars = 20000
+
+# Safety default: only localhost/loopback LM Studio is accepted.
+allow_remote_lmstudio = false
