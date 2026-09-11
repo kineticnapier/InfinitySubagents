@@ -39,6 +39,14 @@ CODE_TOOLS = READ_TOOLS + [
 ]
 
 
+def _tools_for_mode(mode: str) -> list[str]:
+    if mode == "research":
+        return list(READ_TOOLS)
+    if mode == "code":
+        return list(CODE_TOOLS)
+    raise ValueError("mode must be 'research' or 'code'")
+
+
 @dataclass(frozen=True)
 class Config:
     base_url: str
